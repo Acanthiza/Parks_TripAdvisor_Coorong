@@ -1,0 +1,817 @@
+---
+title: "Analysis of Trip Advisor data relating to South Australian parks - Coorong subset"
+author:
+- Department for Environment and Water
+date: "`r format(Sys.time(), '%A, %d %B, %Y')`"
+output:
+  bookdown::gitbook:
+    split_by: chapter
+    toc_depth: 3
+    css: style.css
+    keep_md: no
+csl:                          "common/BibStyle.csl"
+bibliography:                 ["common/refs.bib","rPackages.bib","common/RC.bib"]
+link-citations: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, warning = FALSE, echo = FALSE, message = FALSE}
+
+  coresToUse <- round(parallel::detectCores()*3/4,0)
+
+  useCores <- if(coresToUse < 4) 4 else coresToUse
+
+  packages <- c("knitr"
+                ,"bookdown"
+                ,"tidyverse"
+                ,"readxl"
+                ,"fs"
+                ,"lubridate"
+                ,"tidytext"
+                ,"DT"
+                ,"rstan"
+                ,"rstanarm"
+                ,"ggridges"
+                )
+  
+  purrr::walk(packages,library,character.only=TRUE)
+  
+  write_bib(c("base",packages),file="rPackages.bib",tweak=TRUE)
+  
+  source("common/functions.R")
+  
+  # Set default chunk options (can adjust individual chunks differently if required)
+  knitr::opts_chunk$set(warning = FALSE
+                        , message = FALSE
+                        , echo = FALSE
+                        )
+  
+  options(knitr.kable.NA = "")
+  
+  # Set mapping defaults
+  # tmap_options(basemaps = c("OpenStreetMap.Mapnik"
+  #                           , "Esri.WorldImagery"
+  #                           )
+  #              )
+  
+  # reset ggplot default theme (rstanarm changes it for some reason)
+  theme_set(theme_grey())
+  
+  # Project
+  project <- basename(here::here())
+  
+```
+  
+```{r data}
+
+  searches <- read_csv("data/searches.csv",quote='"')
+
+  dat <- dir_info("data") %>%
+    dplyr::filter(grepl("20190607",path)) %>%
+    dplyr::mutate(data = map(path, read_excel)) %>%
+    dplyr::select(data) %>%
+    tidyr::unnest() %>%
+    dplyr::mutate(User = gsub(" R.$","",User)
+                  , Year = year(Date)
+                  , Month = format(Date,"%B")
+                  , month = as.numeric(format(Date,"%m"))
+                  , Month = fct_reorder(Month,month)
+                  , Yearmon = as_date(paste0("01/",Month,"/",Year),tz=Sys.timezone(),format="%d/%B/%Y")
+                  , Age = gsub("18-34","18-24",age)
+                  , id = row_number()
+                  , reviews = n_distinct(id)
+                  , Stars = as.numeric(Stars)
+                  , Gender = gender
+                  , StateCountry = if_else(Country == "Australia",State,Country)
+                  , Origin = if_else(!is.na(StateCountry)
+                                      , if_else(Country != "Australia"
+                                                , "Overseas"
+                                                , if_else(Country == "Australia" & StateCountry != "South Australia"
+                                                          , "Aus"
+                                                          , "SA"
+                                                          )
+                                                )
+                                      , StateCountry
+                                      )
+                  , Origin = fct_relevel(Origin, "SA","Aus")
+                  , Text = paste0("Title: ",Title," - Review: ",Review)
+                  , Park = if_else(grepl("Onkaparinga",Park),"Onkaparinga National Park",Park)
+                  , Park = if_else(grepl("Flinders Ranges",Park),"Ikara-Flinders Ranges National Park",Park)
+                  ) %>%
+    dplyr::mutate_if(is.character,list(~gsub("^Null$|^Not given$|^null$|N/A",NA,.))) %>%
+    dplyr::select(-month,-age,-gender) %>%
+    dplyr::filter(!grepl("13",Age)
+                  , !grepl("Adelaide Gaol|Cleland Wildlife Park|Seal Bay",Park)
+                  , grepl("Coorong",Park)
+                  )
+
+```
+
+# Introduction
+
+DEW manages many parks across South Australia. Some of these parks have a 'page' on [TripAdvisor](https://www.tripadvisor.com.au/). For example, there is a page for [Ikara-Flinders Ranges National Park](https://www.tripadvisor.com.au/Attraction_Review-g499711-d6456334-Reviews-Flinders_Ranges_National_Park-Hawker_Flinders_Ranges_South_Australia.html).
+
+DEW are interested to know what information is contained in TripAdvisor reviews. Specifically, the following analyses were identified as potentially useful:
+
+* data summary, including which parks were reviewed and by how many people
+* word analysis: overall sentiment
+* activities mentioned
+* facilities mentioned
+* wildlife mentioned
+
+Each of these to be investigated by three major groupings:
+
+* South Australian reviewers
+* Other Australian reviewers
+* Overseas reviewers
+
+
+# Methods
+
+NOTE - FOR THIS DOCUMENT THE DATASET WAS FILTERED TO 'COORONG'. These results have not been checked thorougly.
+
+## Data source
+
+Data were taken from Trip Advisor. The site is one of the most popular sources of reviews for hotels, restaurants, experiences, attractions and places such as parks. Trip Advisor features user-generated content with 315 million reviewers (active and inactive) and about 500 million reviews [Wikipedia](https://en.wikipedia.org/wiki/TripAdvisor). 
+
+For the purposes of this analysis, the search function in Trip Advisor was used to identify all parks, reserves and features in parks and reserves that have been reviewed. Some reviews were captured under a park name, such as "Flinders Chase National Park" and some were captured under a feature name, such as "Flinders Chase Visitor Centre". 
+
+The web scraping software [Octoparse](https://www.octoparse.com/) was used to capture the following elements for analysis: 
+
+* Reviewer name 
+* Reviewer location (country, state and city) 
+* Reviewer age 
+* Reviewer gender 
+* Review date 
+* Review title 
+* Review text 
+* Review star rating 
+
+Note that the web scraping software was able to effectively capture elements such as name, date, title, text and star rating, but that capturing the demographic information about the reviewers was a more difficult process. The demographic information is contained within "hover over" elements of the Trip Advisor web pages. Code was written to scrape these elements for the initial data scrape; manual cutting and pasting was used for scrape updates. It may be for this reason that most academic analysis of Trip Advisor reviews does not extend to considering demographic information and that this report may offer some new information about the utility of this data source. 
+
+Once the data was captured it was cleaned so that it could be more easily used for qualitative analysis. The cleaning included:
+
+* Ensuring that each review was attached to a unique reviewer name 
+* Standardising place names to ensure that spellings were correct 
+* Allocating state and/or countries to reviewers who gave only partial location information such as city of residence
+* Ensuring that the data set contained no blank cells
+* Removing reviewers under 18 years old (remove reviewers where the age field was equal to `13-17`)
+
+A final step was removal of three parks considered outliers with respect to the rest of the dataset:
+
+* Seal Bay Conservation Park
+* Cleland Wildlife Park
+* Adelaide Gaol
+
+Cleland and Seal Bay give people the opportunity to interact with, and even hold, wildlife - behaviour that is not encouraged in other parks; and Adelaide Gaol is an urban heritage site that has very different characteristics to parks.
+
+## Workflow
+
+This data analysis and report writing was done in a single scripted workflow (script file: [`r list.files(here::here(),pattern="Report.Rmd",recursive=TRUE)`](`r paste0("https://github.com/Acanthiza/",project,"/blob/master/",list.files(here::here(),pattern="t.Rmd",recursive=TRUE))`) using the programs 'R' and 'R-studio'.
+
+[R](https://www.r-project.org/) [@R-base] is an open-source platform which makes available a library of packages that can be used and modified as necessary. [R-studio](https://www.rstudio.com/) provides a range of user-friendly features to facilitate interaction with R. The packages used are listed in the appendix: [R packages used] Table \@ref(tab:packages).
+
+All data, code and outputs are stored in a version control system at [`r project`](`r paste0("https://github.com/Acanthiza/",project)`).
+
+# Data exploration
+
+## Summary
+
+Between `r format(min(dat$Date,na.rm=TRUE),"%d/%B/%Y")` and `r format(max(dat$Date,na.rm=TRUE),"%d/%B/%Y")` there were `r nrow(dat)` reviews on TripAdvisor meeting the criteria outline in the [methods].
+
+In total there were `r n_distinct(dat$Park)` Parks with reviews written by `r n_distinct(dat$User)` unique reviewers. The most reviews by any one reviewer was `r dat %>% dplyr::count(User) %>% dplyr::filter(n == max(n)) %>% dplyr::pull(n)` by reviewer ``r dat %>% dplyr::count(User) %>% dplyr::top_n(1) %>% dplyr::pull(User)`` (giving an average of `r dat %>% dplyr::add_count(User) %>% dplyr::filter(n == max(n)) %>% dplyr::pull(Stars) %>% mean() %>% round(1)` stars [and a range between `r dat %>% dplyr::add_count(User) %>% dplyr::filter(n == max(n)) %>% dplyr::pull(Stars) %>% min()` and `r dat %>% dplyr::add_count(User) %>% dplyr::filter(n == max(n)) %>% dplyr::pull(Stars) %>% max()`]).
+
+The park with the most reviews was `r dat %>% dplyr::count(Park) %>% dplyr::top_n(1) %>% dplyr::pull(Park)` with `r dat %>% dplyr::add_count(Park) %>% dplyr::filter(n == max(n)) %>% nrow()` reviews, averaging  `r dat %>% dplyr::add_count(Park) %>% dplyr::filter(n == max(n)) %>% dplyr::pull(Stars) %>% mean() %>% round(1)` stars. One star reviews accounted for `r round(100*(dat %>% dplyr::add_count(Park) %>% dplyr::filter(n == max(n)) %>% dplyr::count(Stars) %>% dplyr::filter(Stars == 1) %>% dplyr::pull(n)/dat %>% dplyr::add_count(Park) %>% dplyr::filter(n == max(n)) %>% nrow()),1)`% of the reviews and five star reviews accounted for `r round(100*(dat %>% dplyr::add_count(Park) %>% dplyr::filter(n == max(n)) %>% dplyr::count(Stars) %>% dplyr::filter(Stars == 5) %>% dplyr::pull(n)/dat %>% dplyr::add_count(Park) %>% dplyr::filter(n == max(n)) %>% nrow()),1)`%.
+
+## Missing data
+
+```{r dataMissing}
+
+  datMiss <- dat %>%
+    summarise_all(list(~sum(is.na(.)))) %>%
+    t() %>%
+    data.frame() %>%
+    rownames_to_column() %>%
+    dplyr::rename(column = 1, NAs = 2) %>%
+    dplyr::mutate(per = 100*NAs/nrow(dat)
+                  , column = fct_inorder(column)
+                  )
+
+```
+
+Some of the key data fields were left blank in many reviews. For example, `r sum(is.na(dat$Gender))` (`r round(100*sum(is.na(dat$Gender))/nrow(dat),0)`%) reviews did not provide their gender and `r sum(is.na(dat$Age))` (`r round(100*sum(is.na(dat$Age))/nrow(dat),0)`%) didn't provide their age. Figure \@ref(fig:plotMissing) shows the percentage of reviews that did not provide information against each field.
+
+```{r plotMissing, fig.cap = "A large proportion of reviews did not answer some questions, particularly Gender and Age"}
+
+  ggplot(datMiss, aes(column,per)) +
+    geom_col() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    labs(x = "Column"
+         , y = "Percentage of null (NA) cells in each column"
+         )
+
+```
+
+## Count of reviews
+
+```{r dataCount}
+  
+  datCount <- dat %>%
+    dplyr::select(-Title,-Review,-Yearmon,-Date,-contains("URL")) %>%
+    tidyr::gather(variable,value,1:ncol(.)) %>%
+    dplyr::count(variable,value) 
+
+```
+
+There are several variables in the data with relatively few levels: `r vec_to_sentence(unique(pull(datCount,variable)),";")`. Figure \@ref(fig:plotDiscrete) shows the most frequently occuring values in each of those variables.
+
+```{r plotDiscrete, fig.height = 12, fig.cap = "Most frequent values in each of the variables. Most reviews were from Adelaide based 50-64 year old Females called Steve who visited Flinders Chase in January 2016 and gave it 5 stars"}
+  
+  ggplot(datCount %>%
+           dplyr::filter(n > 2) %>%
+           dplyr::group_by(variable) %>%
+           dplyr::mutate(levels = n()) %>%
+           dplyr::top_n(12,n) %>%
+           dplyr::filter(levels > 2) %>%
+           dplyr::ungroup() %>%
+           dplyr::mutate(value = substr(value,1,20)
+                         , value = fct_reorder(value,n)
+                         )
+         ) +
+    geom_col(aes(value,n)) +
+    facet_wrap(~variable, scales = "free",ncol=2) +
+    coord_flip() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    labs(x = "Value of variable"
+         , y = "Count of value"
+         )
+
+```
+
+# Words
+
+```{r dataWord}
+
+  fixSentiment <- c("wild","desert","falls","unbelievable","unusual","unexpected","miss","remarkable","cold","dirt","rocky","crashing","downhill","shady","ruins","cave","wedge")
+
+  removeWords <- c("title","review","granite","island","national","park","flinders","ranges","kangaroo","chase","victor","harbor","harbour","morialta","adelaide","mt","mount","lofty","coober","pedy","rocks","arch","gully","ki","wilpena","pound","coffin","coorong")
+  
+  changeWords <- tribble(~word, ~changed
+                         , "disappointing","disappoint"
+                         , "disappointed","disappoint"
+                         , "disappointment","disappoint"
+                         , "colours","colour"
+                         , "color","colour"
+                         , "beauty","beautiful"
+                         , "enjoyed","enjoy"
+                         , "loved","love"
+                         , "sadly","sad"
+                         , "difficulty","difficult"
+                         , "crowded","crowd"
+                         , "limits","limit"
+                         , "beaches","beach"
+                         , "cycling","cycle"
+                         , "cycled","cycle"
+                         , "cyclists","cycle"
+                         , "riding","cycle"
+                         , "rides","cycle"
+                         , "mtb","cycle"
+                         , "bike","cycle"
+                         , "rode","cycle"
+                         , "walking","walk"
+                         , "walked","walk"
+                         , "walks","walk"
+                         , "stroll","walk"
+                         , "strolling","walk"
+                         , "hiking","walk"
+                         , "hiked","walk"
+                         , "hike", "walk"
+                         , "camping","camp"
+                         , "camped","camp"
+                         , "driving","drive"
+                         , "drove","drive"
+                         , "penguin","wildlife"
+                         , "penguins","wildlife"
+                         , "fur","wildlife"
+                         , "seal","wildlife"
+                         , "seals","wildlife"
+                         , "koala","wildlife"
+                         , "koalas","wildlife"
+                         , "kangaroos","wildlife" # not kangaroos due to KI
+                         , "echidna","wildlife"
+                         , "platypus","wildlife"
+                         , "bird","wildlife"
+                         , "birds","wildlife"
+                         , "wallabies","wildlife"
+                         , "emu","wildlife"
+                         , "emus","wildlife"
+                         , "animals","wildlife"
+                         , "lions","wildlife" # sea lions
+                         , "sealions","wildlife"
+                         , "landscape","nature"
+                         , "view","nature"
+                         , "views","nature"
+                         , "scenery","nature"
+                         , "scenic","nature"
+                         , "natural","nature"
+                         , "breakaways","nature"
+                         , "remarkable","nature"
+                         , "admirals","nature"
+                         , "waterfall","nature"
+                         , "falls","nature"
+                         , "waterfalls","nature"
+                         , "lighthouse","heritage"
+                         , "ruin","heritage"
+                         )
+  
+  datWord <- dat %>%
+    tidytext::unnest_tokens(word,Text,drop = FALSE) %>%
+    dplyr::left_join(changeWords) %>%
+    dplyr::mutate(word = if_else(is.na(changed),word,changed)) %>%
+    dplyr::anti_join(tidytext::stop_words) %>%
+    dplyr::left_join(tidytext::get_sentiments("bing")) %>%
+    dplyr::mutate(sentiment = ifelse(word %in% fixSentiment,NA,sentiment)
+                  , sentiment = fct_explicit_na(sentiment,"neutral")
+                  ) %>%
+    dplyr::filter(!word %in% removeWords) %>%
+    dplyr::mutate(textChar = nchar(Text))
+  
+
+  datForPlot <- datWord %>%
+    dplyr::group_by(Origin) %>%
+    dplyr::mutate(nOrigin = n_distinct(id)) %>%
+    dplyr::ungroup() %>%
+    dplyr::count(id, Origin, nOrigin, reviews, word, sentiment, sort = TRUE) %>%
+    dplyr::count(Origin, nOrigin, reviews, word, sentiment, sort = TRUE) %>%
+    dplyr::group_by(Origin, sentiment) %>%
+    dplyr::slice(1:10) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(per = 100*n/reviews
+                  , word = fct_reorder(word,per)
+                  , sentiment = fct_explicit_na(sentiment, na_level = "neutral")
+                  , sentiment = fct_relevel(sentiment, "positive", "negative")
+                  ) %>%
+    dplyr::select(Origin,nOrigin,word,sentiment,n,per) %>%
+    dplyr::group_by(word) %>%
+    dplyr::mutate(levels = n()) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(levels >= 2/3*max(levels))
+
+  mostPos <- datWord %>% dplyr::filter(sentiment == "positive") %>% dplyr::count(word) %>% dplyr::top_n(1,n) %>% dplyr::pull(word)
+  mostNeg <- datWord %>% dplyr::filter(sentiment == "negative") %>% dplyr::count(word) %>% dplyr::top_n(1,n) %>% dplyr::pull(word)
+  mostNeut <- datWord %>% dplyr::filter(sentiment == "neutral") %>% dplyr::count(word) %>% dplyr::top_n(1,n) %>% dplyr::pull(word)
+  
+  # cont <- datForPlot %>% dplyr::mutate(failure = nOrigin-n) %>% dplyr::select(Origin,word,success=n,failure)
+  
+  options(mc.cores = 4)
+  wordGLM <- success_failure_GLM(datForPlot %>%
+                               dplyr::mutate(failure = nOrigin-n) %>%
+                               dplyr::select(Origin,word,success=n,failure)
+                             )
+
+```
+
+Using the tidytext package [@R-tidytext], the text within the character fields `Title` and `Review` were analysed. Some words were replaced with a synonym (Appendix Table \@ref(tab:changeWords)). This includes 'lumping' words such as, say, `echidna` into `wildlife`. 
+
+The following words were reclassified as neutral from negative sentiment as they were overwhelmingly not used in a negative manner (e.g. Table \@ref(tab:neutral)): `r vec_to_sentence(sort(fixSentiment),";")`.
+
+The following words were removed from the analysis as they refer to park or place names, and occur frequently, but do not add much to the analysis: `r vec_to_sentence(sort(removeWords),";")`.
+
+Figure \@ref(fig:wordOverall) shows the ten most common positive, negative and neutral words given in the combined `Title` and `Review` fields.
+
+The most frequent word with:
+
+* positive sentiment was `r mostPos`
+* negative sentiment was `r mostNeg`
+* neutral sentiment was `r mostNeut`.
+
+The words that were most different between the groups were:
+
+* `r paste0(wordGLM["modDiffRes"][[1]] %>% dplyr::top_n(3,alpha) %>% dplyr::pull(text) %>% gsub("\n"," ",.),collapse="\n* ")`
+
+---
+
+```{r neutral}
+
+  kable(datWord %>%
+          dplyr::filter(textChar < 500
+                        , word %in% fixSentiment
+                        ) %>%
+          dplyr::select(User,Stars,`Reclassified word` = word,Text) %>%
+          unique() %>%
+          dplyr::sample_n(3)
+        , caption = "A few examples of text containing words reclassified from negative to neutral"
+        )
+
+```
+
+---
+
+```{r wordOverall, fig.cap = paste0("The words most used in reviews were: ",datWord %>% dplyr::count(word) %>% dplyr::top_n(3,n) %>% dplyr::pull(word) %>% vec_to_sentence())}
+  
+  ggplot(datForPlot, aes(word,per,fill=sentiment)) +
+    geom_col() +
+    coord_flip() +
+    facet_grid(~Origin) +
+    scale_fill_viridis_d(end = 0.8) +
+    labs(y = "Percentage of titles using word (or synonym)")
+
+```
+
+---
+
+```{r wordGLMPlot, fig.height = 10, fig.cap = paste0("Large differences between groups are highlighted by fading, for example there is a ",wordGLM$modDiffRes %>% dplyr::group_by(colour) %>% dplyr::top_n(1,alpha) %>% pull(text) %>% vec_to_sentence(";") %>% gsub("\n"," ",.))}
+
+  p <- wordGLM$modPlotDiff
+
+  p +
+    theme(legend.position = "bottom")
+
+```
+
+# Activities
+
+```{r datactivity}
+
+  activities <- searches %>%
+    dplyr::filter(Type == "activity") %>%
+    dplyr::group_by(Use) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(activity = map(data
+                                 , function(x) tibble(activity = str_detect(tolower(dat$Text),tolower(paste(x$Find,collapse="|")))) %>%
+                                   dplyr::bind_cols(dat[,c("id","Origin")])
+                                 )
+                  ) %>%
+    tidyr::unnest(activity) %>%
+    dplyr::filter(activity) %>%
+    dplyr::add_count(Use) %>%
+    dplyr::group_by(Use,n,Origin) %>%
+    dplyr::summarise(nUse = n()) %>%
+    dplyr::ungroup() %>%
+    dplyr::left_join(dat %>% dplyr::count(Origin) %>% dplyr::rename(total = n)) %>%
+    dplyr::mutate(per = 100*nUse/total
+                  , Use = fct_reorder(Use,n)
+                  , text = paste0(Use,": ",round(per,1),"%")
+                  , overallText = paste0(Use,": ",round(100*n/nrow(dat),1),"%")
+                  )
+  
+  activityGLM <- success_failure_GLM(activities %>%
+                                   # dplyr::group_by(Use) %>%
+                                   # dplyr::mutate(levels = n()) %>%
+                                   # dplyr::ungroup() %>%
+                                   # dplyr::filter(levels == max(levels)) %>%
+                                   dplyr::mutate(success = nUse
+                                                 , failure = total-success
+                                                 ) %>%
+                                   dplyr::select(Origin,Use,success,failure)
+                                 )
+
+```
+
+These activities were searched for in the combined `Title` and `Review` fields: `r searches %>% dplyr::filter(Type == "activity") %>% dplyr::count(Use) %>% dplyr::pull(Use) %>% unique() %>% vec_to_sentence(";")`. Appendix Table \@ref(tab:activities) shows which words were treated as synonyms for each activity.
+
+Figure \@ref(fig:activityOverall) shows how frequently each of those activities were mentioned overall.
+
+The words that were most different between the groups were:
+
+* `r paste0(activityGLM["modDiffRes"][[1]] %>% dplyr::top_n(3,alpha) %>% dplyr::pull(text) %>% gsub("\n"," ",.),collapse="\n* ")`
+
+---
+
+```{r activityOverall, fig.cap = paste0("The activities most mentioned in reviews were: ",activities %>% dplyr::select(Use,n) %>% unique() %>% dplyr::top_n(3,n) %>% dplyr::pull(Use) %>% vec_to_sentence())}
+
+  activities %>%
+    ggplot(aes(Use,per)) +
+      geom_bar(stat = "identity") +
+      coord_flip() +
+      facet_grid(~Origin) +
+      labs(y = "Percentage of reviews by origin of reviewer"
+          , x = "Activity"
+           )
+
+```
+
+---
+
+```{r activityGLMPlot, fig.height = 10, fig.cap = paste0("Large differences between groups are highlighted by fading, for example there is a ",activityGLM$modDiffRes %>% dplyr::group_by(colour) %>% dplyr::top_n(1,alpha) %>% pull(text) %>% vec_to_sentence(";") %>% gsub("\n"," ",.))}
+
+  p<- activityGLM$modPlotDiff
+
+  p +
+    theme(legend.position = "bottom")
+
+```
+
+# Facilities
+
+```{r dataFacility}
+  
+  facilities <- searches %>%
+    dplyr::filter(Type == "facility") %>%
+    dplyr::group_by(Use) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(facility = map(data
+                                 , function(x) tibble(facility = str_detect(tolower(dat$Text),tolower(paste(x$Find,collapse="|")))) %>%
+                                   dplyr::bind_cols(dat[,c("id","Origin")])
+                                 )
+                  ) %>%
+    tidyr::unnest(facility) %>%
+    dplyr::filter(facility) %>%
+    dplyr::add_count(Use) %>%
+    dplyr::group_by(Use,n,Origin) %>%
+    dplyr::summarise(nUse = n()) %>%
+    dplyr::ungroup() %>%
+    dplyr::left_join(dat %>% dplyr::count(Origin) %>% dplyr::rename(total = n)) %>%
+    dplyr::mutate(per = 100*nUse/total
+                  , Use = fct_reorder(Use,n)
+                  , text = paste0(Use,": ",round(per,1),"%")
+                  , overallText = paste0(Use,": ",round(100*n/nrow(dat),1),"%")
+                  )
+
+  facilityGLM <- success_failure_GLM(facilities %>%
+                                   # dplyr::group_by(Use) %>%
+                                   # dplyr::mutate(levels = n()) %>%
+                                   # dplyr::ungroup() %>%
+                                   # dplyr::filter(levels == max(levels)) %>%
+                                   dplyr::mutate(success = nUse
+                                                 , failure = total-success
+                                                 ) %>%
+                                   dplyr::select(Origin,Use,success,failure)
+                                 )
+  
+```
+
+These facilities were searched for in the combined `Title` and `Review` fields: `r searches %>% dplyr::filter(Type == "facility") %>% dplyr::count(Use) %>% dplyr::pull(Use) %>% unique() %>% vec_to_sentence(";")`. Appendix Table \@ref(tab:facilities) shows which words were treated as synonyms for each type of facility.
+
+Figure \@ref(fig:facilityOverall) shows how frequently each facility was mentioned.
+
+The words that were most different between the groups were:
+
+* `r paste0(facilityGLM["modDiffRes"][[1]] %>% dplyr::top_n(3,alpha) %>% dplyr::pull(text) %>% gsub("\n"," ",.),collapse="\n* ")`
+
+---
+
+```{r facilityOverall, fig.cap = paste0("The facilities most mentioned in reviews were: ",facilities %>% dplyr::select(Use,n) %>% unique() %>% dplyr::top_n(3,n) %>% dplyr::pull(Use) %>% vec_to_sentence())}
+
+  facilities %>%
+    ggplot(aes(Use,per)) +
+      geom_bar(stat = "identity") +
+      coord_flip() +
+      facet_grid(~Origin) +
+      labs(y = "Percentage of reviews by origin of reviewer"
+          , x = "Facility"
+           )
+
+```
+
+---
+
+```{r facilityGLMPlot, fig.height = 10, fig.cap = paste0("Large differences between groups are highlighted by fading, for example there is a ",facilityGLM$modDiffRes %>% dplyr::group_by(colour) %>% dplyr::top_n(1,alpha) %>% pull(text) %>% vec_to_sentence(";") %>% gsub("\n"," ",.))}
+
+  p <- facilityGLM$modPlotDiff
+
+  p +
+    theme(legend.position = "bottom")
+
+```
+
+# Wildlife
+
+```{r dataWildlife}
+  
+  wildlife <- searches %>%
+    dplyr::filter(Type == "wildlife") %>%
+    dplyr::group_by(Use) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(wildlife = map(data
+                                 , function(x) tibble(wildlife = str_detect(tolower(dat$Text),tolower(paste(x$Find,collapse="|")))) %>%
+                                   dplyr::bind_cols(dat[,c("id","Origin")])
+                                 )
+                  ) %>%
+    tidyr::unnest(wildlife) %>%
+    dplyr::filter(wildlife) %>%
+    dplyr::add_count(Use) %>%
+    dplyr::group_by(Use,n,Origin) %>%
+    dplyr::summarise(nUse = n()) %>%
+    dplyr::ungroup() %>%
+    dplyr::left_join(dat %>% dplyr::count(Origin) %>% dplyr::rename(total = n)) %>%
+    dplyr::mutate(per = 100*nUse/total
+                  , Use = fct_reorder(Use,n)
+                  , text = paste0(Use,": ",round(per,1),"%")
+                  , overallText = paste0(Use,": ",round(100*n/nrow(dat),1),"%")
+                  )
+
+  wildlifeGLM <- success_failure_GLM(wildlife %>%
+                                   # dplyr::group_by(Use) %>%
+                                   # dplyr::mutate(levels = n()) %>%
+                                   # dplyr::ungroup() %>%
+                                   # dplyr::filter(levels == max(levels)) %>%
+                                   dplyr::mutate(success = nUse
+                                                 , failure = total-success
+                                                 ) %>%
+                                   dplyr::select(Origin,Use,success,failure)
+                                 )
+  
+```
+
+These wildlife were searched for in the combined `Title` and `Review` fields: `r searches %>% dplyr::filter(Type == "wildlife") %>% dplyr::count(Use) %>% dplyr::pull(Use) %>% unique() %>% vec_to_sentence(";")`. Appendix Table \@ref(tab:wildlife) shows which words were treated as synonyms for each type of wildlife.
+
+Figure \@ref(fig:wildlifeOverall) shows how frequently each wildlife was mentioned.
+
+The words that were most different between the groups were:
+
+* `r paste0(wildlifeGLM["modDiffRes"][[1]] %>% dplyr::top_n(3,alpha) %>% dplyr::pull(text) %>% gsub("\n"," ",.),collapse="\n* ")`
+
+---
+
+```{r wildlifeOverall, fig.cap = paste0("The wildlife most mentioned in reviews were: ",wildlife %>% dplyr::select(Use,n) %>% unique() %>% dplyr::top_n(3,n) %>% dplyr::pull(Use) %>% vec_to_sentence())}
+
+  wildlife %>%
+    ggplot(aes(Use,per)) +
+      geom_bar(stat = "identity") +
+      coord_flip() +
+      facet_grid(~Origin) +
+      labs(y = "Percentage of reviews by origin of reviewer"
+          , x = "wildlife"
+           )
+
+```
+
+---
+
+```{r wildlifeGLMPlot, fig.height = 10, fig.cap = paste0("Large differences between groups are highlighted by fading, for example there is a ",wildlifeGLM$modDiffRes %>% dplyr::group_by(colour) %>% dplyr::top_n(1,alpha) %>% pull(text) %>% vec_to_sentence(";") %>% gsub("\n"," ",.))}
+
+  p <- wildlifeGLM$modPlotDiff
+
+  p +
+    theme(legend.position = "bottom")
+
+```
+
+# Summary
+
+The TripAdvisor data has little resolution in stars given for the attributes available for analysis. Most reviewers give South Australian DEW managed parks very good reviews - roughly `r dat %>% pull(Stars) %>% mean() %>% round(1)` stars on average. Only `r round(100*(dat %>% dplyr::filter(Stars < 3) %>% nrow())/nrow(dat),1)`% of reviews gave less than three stars.
+
+## Words used in reviews
+
+The word analysis showed mostly positive words were used to describe parks (e.g. Figure \@ref(fig:wordOverall)).
+
+Reviewers most frequently mentioned `r datWord %>% dplyr::filter(sentiment == "neutral") %>% dplyr::count(word) %>% dplyr::top_n(3,n) %>% dplyr::pull(word) %>% vec_to_sentence(";")` in their reviews along with positive words such as `r datWord %>% dplyr::filter(sentiment == "positive") %>% dplyr::count(word) %>% dplyr::top_n(5,n) %>% dplyr::pull(word) %>% vec_to_sentence(";")`.
+
+Depending on the origin of the reviewer certain words were used more, or less, frequently (also see Figures \@ref(fig:wordOverall) and \@ref(fig:wordGLMPlot)):
+
+  * `r paste0(wordGLM$modDiffRes %>% dplyr::select(alpha,text) %>% dplyr::top_n(3,alpha) %>% dplyr::pull(text) %>% gsub("\n"," ",.),collapse = "\n* ")`
+
+## Activities
+
+The most popular activities (and % of reviews in which the activity was mentioned) were:
+ 
+ * `r paste0(activities %>% dplyr::select(Use,n,overallText) %>% unique() %>% dplyr::top_n(3,n) %>% dplyr::pull(overallText),collapse = "\n* ")`
+ 
+Depending on the origin of the reviewer certain activities were mentioned more, or less, frequently (also see Figures \@ref(fig:activityOverall) and \@ref(fig:activityGLMPlot)):
+
+  * `r paste0(activityGLM$modDiffRes %>% dplyr::select(alpha,text) %>% dplyr::top_n(3,alpha) %>% dplyr::pull(text) %>% gsub("\n"," ",.),collapse = "\n* ")`
+ 
+## Facilities
+
+The faciltities most mentioned in reviews (and % of reviews in which the activity was mentioned) were:
+ 
+ * `r paste0(facilities %>% dplyr::select(Use,n,overallText) %>% unique() %>% dplyr::top_n(3,n) %>% dplyr::pull(overallText),collapse = "\n* ")`
+ 
+Depending on the origin of the reviewer certain facilities were mentioned more, or less, frequently (also see Figures \@ref(fig:facilityOverall) and \@ref(fig:facilityGLMPlot)):
+
+  * `r paste0(facilityGLM$modDiffRes %>% dplyr::select(alpha,text) %>% dplyr::top_n(3,alpha) %>% dplyr::pull(text) %>% gsub("\n"," ",.),collapse = "\n* ")`
+
+## Wildlife
+
+The wildlife most mentioned in reviews (and % of reviews in which the activity was mentioned) were:
+ 
+ * `r paste0(wildlife %>% dplyr::select(Use,n,overallText) %>% unique() %>% dplyr::top_n(3,n) %>% dplyr::pull(overallText),collapse = "\n* ")`
+ 
+Depending on the origin of the reviewer certain facilities were mentioned more, or less, frequently (also see Figures \@ref(fig:wildlifeOverall) and \@ref(fig:wildlifeGLMPlot)):
+
+  * `r paste0(wildlifeGLM$modDiffRes %>% dplyr::select(alpha,text) %>% dplyr::top_n(3,alpha) %>% dplyr::pull(text) %>% gsub("\n"," ",.),collapse = "\n* ")`
+
+# Appendix
+
+## Changed words
+
+```{r changeWords}
+
+  kable(changeWords
+        , caption = "Words that were changed to a synonym before further analysis"
+        )
+
+```
+
+## Activities
+
+```{r activities}
+
+  kable(searches %>% dplyr::filter(Type == "activity") %>% dplyr::select(-Notes)
+        , caption = "Activities and associated synonyms, including regular expression syntax used in searches. e.g. '.?' means match a space zero or one time; (?!...) is a negative lookaround (e.g. used for find 'dog' without 'fence')"
+        )
+
+```
+
+---
+
+```{r activityAll,results="asis"}
+
+  cat("<table>",paste0("<caption>","(#tab:activityAll)","Full activities results","</caption>"),"</table>", sep = "\n")
+  
+  datatable(activities %>%
+              dplyr::mutate_if(is.numeric,round,1) %>%
+              dplyr::select(Activity = Use
+                            , Origin
+                            , `Mention activity` = nUse
+                            , Reviews = total
+                            , Percentage = per
+                            )
+            , filter = "top"
+            ) 
+
+```
+
+---
+
+## Facilities
+
+```{r facilities}
+
+  kable(searches %>% dplyr::filter(Type == "facility") %>% dplyr::select(-Notes)
+        , caption = "Facilities and associated synonyms, including regular expression syntax used in searches. e.g. '.?' means match a space zero or one time"
+        )
+
+```
+
+---
+
+```{r facilityAll,results="asis"}
+
+  cat("<table>",paste0("<caption>","(#tab:facilityAll)","Full facilities results","</caption>"),"</table>", sep = "\n")
+  
+  datatable(facilities %>%
+              dplyr::mutate_if(is.numeric,round,1) %>%
+              dplyr::select(Facility = Use
+                            , Origin
+                            , `Mention facility` = nUse
+                            , Reviews = total
+                            , Percentage = per
+                            )
+            , filter = "top"
+            ) 
+
+```
+
+---
+
+## Wildlife
+
+```{r wildlife}
+
+  kable(searches %>% dplyr::filter(Type == "wildlife") %>% dplyr::select(-Notes)
+        , caption = "Wildlife and associated synonyms, including regular expression syntax used in searches. e.g. '.?' means match a space zero or one time"
+        )
+
+```
+
+---
+
+```{r wildlifeAll,results="asis"}
+
+  cat("<table>",paste0("<caption>","(#tab:wildlifeAll)","Full wildife results","</caption>"),"</table>", sep = "\n")
+  
+  datatable(wildlife %>%
+              dplyr::mutate_if(is.numeric,round,1) %>%
+              dplyr::select(Wildlife = Use
+                            , Origin
+                            , `Mention wildlife` = nUse
+                            , Reviews = total
+                            , Percentage = per
+                            )
+            , filter = "top"
+            ) 
+
+```
+
+---
+
+## R packages used
+
+```{r packages, fig.cap = "R [@R-base] packages used to produce this report"}
+
+  kable(tibble(Package = read_lines("rPackages.bib")) %>%
+    dplyr::filter(grepl("@",Package)
+                  , !grepl("CiteR",Package)
+                  ) %>%
+    dplyr::mutate(Package = gsub("@Manual\\{|,|R-","",Package)) %>%
+    dplyr::arrange() %>%
+    dplyr::mutate(Citation = paste0("@R-",Package))
+   , caption = "R [@R-base] packages used in the production of this report" 
+   )
+
+```
+
+# References
